@@ -1,131 +1,104 @@
-#!/usr/bin/env python3
-
 import rospy
 import cv2
 import numpy as np
+import threading
 from sensor_msgs.msg import Image
-from geometry_msgs.msg import Twist
 from cv_bridge import CvBridge
 from puppy_control.srv import SetRunActionName
+from puppy_control.msg import Velocity, Pose
+from common import PID  # Use the PID from your robot
 
 class CupFollower:
-
     def __init__(self):
         rospy.init_node('cup_follower')
-
+        
         self.bridge = CvBridge()
-
-        # ----------- Stand at Startup -----------
-        rospy.loginfo("Waiting for stand service...")
+        self.lock = threading.RLock()
+        
+        # Publishers
+        self.velocity_pub = rospy.Publisher('/puppy_control/velocity', Velocity, queue_size=1)
+        self.pose_pub = rospy.Publisher('/puppy_control/pose', Pose, queue_size=1)
+        
+        # State
+        self.target_color = None  # Will be set to white
+        self.tracker = None
+        self.is_running = False
+        
+        # PID for steering
+        self.x_pid = PID.PID(P=0.001, I=0.0001, D=0.00005)
+        
+        # Stand up first
         rospy.wait_for_service('/puppy_control/runActionGroup')
-
-        try:
-            stand_srv = rospy.ServiceProxy(
-                '/puppy_control/runActionGroup',
-                SetRunActionName
-            )
-            rospy.loginfo("Standing robot...")
-            stand_srv('stand.d6ac', True)
-            rospy.sleep(2.0)
-        except rospy.ServiceException as e:
-            rospy.logerr(e)
-
-        # ----------- ROS Interfaces -----------
-        self.image_sub = rospy.Subscriber(
-            "/usb_cam/image_raw",
-            Image,
-            self.image_callback,
-            queue_size=1
-        )
-
-        self.cmd_pub = rospy.Publisher("/cmd_vel", Twist, queue_size=10)
-
-        # ----------- Control Parameters -----------
-        self.linear_speed = 0.10
-        self.angular_gain = 0.0025
-        self.max_angular = 0.5
-
-        # NORMAL CUP SIZE TUNING (for 320x240 resolution)
-        self.min_detect_area = 800        # ignore noise
-        self.stop_area = 12000            # stop distance
-        self.dead_zone = 15               # pixels
-
-        # smoothing
-        self.last_area = 0
-        self.smooth_factor = 0.6
-
-        rospy.loginfo("Optimized OpenCV Cup Follower Started.")
+        stand_srv = rospy.ServiceProxy('/puppy_control/runActionGroup', SetRunActionName)
+        stand_srv('stand.d6ac', True)
+        rospy.sleep(2.0)
+        
+        # Subscribe to camera
+        self.image_sub = rospy.Subscriber('/usb_cam/image_raw', Image, self.image_callback, queue_size=1)
+        
+        # Initialize tracker directly (skip color picker for white cup)
+        self.target_color = ([255, 255, 255], [255, 255, 255])  # LAB and RGB for white
+        self.tracker = ObjectTracker(self.target_color)  # Use your robot's ObjectTracker class
+        self.is_running = True  # Start immediately
+        
+        rospy.loginfo("Cup Follower Started")
 
     def image_callback(self, msg):
+        try:
+            # Convert ROS to OpenCV
+            rgb_image = np.frombuffer(msg.data, dtype=np.uint8).reshape(
+                (msg.height, msg.width, 3)
+            )
+            
+            if self.tracker and self.is_running:
+                # Process tracking
+                result = self.tracker(rgb_image, rgb_image.copy(), 0.2)
+                
+                # Control robot
+                self.control_movement()
+                
+        except Exception as e:
+            rospy.logerr(f"Error: {e}")
 
-        frame = self.bridge.imgmsg_to_cv2(msg, "bgr8")
-        frame = cv2.resize(frame, (320, 240))
-
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-
-        # -------- White Cup HSV --------
-        lower = np.array([0, 0, 190])
-        upper = np.array([180, 50, 255])
-
-        mask = cv2.inRange(hsv, lower, upper)
-
-        kernel = np.ones((5, 5), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-
-        contours, _ = cv2.findContours(
-            mask,
-            cv2.RETR_EXTERNAL,
-            cv2.CHAIN_APPROX_SIMPLE
-        )
-
-        twist = Twist()
-
-        if contours:
-            largest = max(contours, key=cv2.contourArea)
-            area = cv2.contourArea(largest)
-
-            # Ignore very small objects (noise)
-            if area < self.min_detect_area:
-                self.search(twist)
-                self.cmd_pub.publish(twist)
-                return
-
-            # Smooth area (avoid jitter)
-            area = self.smooth_factor * area + (1 - self.smooth_factor) * self.last_area
-            self.last_area = area
-
-            x, y, w, h = cv2.boundingRect(largest)
-            center_x = x + w // 2
-            image_center = frame.shape[1] // 2
-            error_x = center_x - image_center
-
-            # Apply dead zone (avoid shaking)
-            if abs(error_x) < self.dead_zone:
-                error_x = 0
-
-            # Steering
-            angular = -error_x * self.angular_gain
-            angular = max(min(angular, self.max_angular), -self.max_angular)
-
-            # Forward control
-            if area < self.stop_area:
-                twist.linear.x = self.linear_speed
-                twist.angular.z = angular
+    def control_movement(self):
+        with self.lock:
+            if self.tracker and self.tracker.last_color_circle:
+                (x, y), r = self.tracker.last_color_circle
+                
+                # Image dimensions
+                img_w, img_h = 320, 240
+                
+                # PID for X (steering)
+                self.x_pid.SetPoint = img_w / 2.0
+                self.x_pid.update(x)
+                yaw_rate = self.x_pid.output
+                yaw_rate = max(min(yaw_rate, 0.5), -0.5)
+                
+                # Area-based forward speed
+                area = 3.14159 * r * r
+                if area < 5000:
+                    forward = 10.0  # Move forward
+                elif area > 15000:
+                    forward = 0.0   # Stop (close enough)
+                else:
+                    forward = 5.0   # Slow approach
+                
+                # Publish velocity
+                vel = Velocity()
+                vel.x = forward
+                vel.y = 0.0
+                vel.yaw_rate = -yaw_rate  # Negative to correct direction
+                
+                self.velocity_pub.publish(vel)
+                rospy.loginfo(f"Moving: x={vel.x}, yaw={vel.yaw_rate:.3f}, area={area:.0f}")
             else:
-                twist.linear.x = 0.0
-                twist.angular.z = 0.0
-                rospy.loginfo("Cup reached. Stopping.")
-
-        else:
-            self.search(twist)
-
-        self.cmd_pub.publish(twist)
-
-    def search(self, twist):
-        twist.linear.x = 0.0
-        twist.angular.z = 0.25
-
+                # Search - rotate in place
+                vel = Velocity()
+                vel.x = 0.0
+                vel.y = 0.0
+                vel.yaw_rate = 5.0  # Rotate to search
+                self.velocity_pub.publish(vel)
+                rospy.loginfo("Searching...")
 
 if __name__ == '__main__':
     try:
