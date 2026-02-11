@@ -2,11 +2,11 @@
 
 import rospy
 import cv2
+import numpy as np
 from sensor_msgs.msg import Image
 from geometry_msgs.msg import Twist
 from cv_bridge import CvBridge
-from ultralytics import YOLO
-from puppy_control_msgs.srv import SetRunActionName
+from puppy_control.srv import SetRunActionName
 
 class CupFollower:
 
@@ -24,15 +24,11 @@ class CupFollower:
                 '/puppy_control/runActionGroup',
                 SetRunActionName
             )
-            rospy.loginfo("Sending stand action...")
+            rospy.loginfo("Standing robot...")
             stand_srv('stand.d6ac', True)
             rospy.sleep(2.0)
-            rospy.loginfo("Robot standing.")
         except rospy.ServiceException as e:
-            rospy.logerr(f"Stand service failed: {e}")
-
-        # ----------- Load YOLO Model -----------
-        self.model = YOLO('/home/ubuntu/puppypi/yolov8n.pt')
+            rospy.logerr(e)
 
         # ----------- ROS Interfaces -----------
         self.image_sub = rospy.Subscriber(
@@ -45,72 +41,90 @@ class CupFollower:
         self.cmd_pub = rospy.Publisher("/cmd_vel", Twist, queue_size=10)
 
         # ----------- Control Parameters -----------
-        self.linear_speed = 0.12
-        self.angular_gain = 0.004
-        self.max_angular = 0.6
-        self.stop_area = 40000
-        self.conf_threshold = 0.4
+        self.linear_speed = 0.10
+        self.angular_gain = 0.0025
+        self.max_angular = 0.5
 
-        # ----------- Performance Control -----------
-        self.frame_count = 0
-        self.inference_interval = 5  # Run YOLO every 5 frames
+        # NORMAL CUP SIZE TUNING (for 320x240 resolution)
+        self.min_detect_area = 800        # ignore noise
+        self.stop_area = 12000            # stop distance
+        self.dead_zone = 15               # pixels
 
-        rospy.loginfo("YOLO Cup Follower Started.")
+        # smoothing
+        self.last_area = 0
+        self.smooth_factor = 0.6
+
+        rospy.loginfo("Optimized OpenCV Cup Follower Started.")
 
     def image_callback(self, msg):
 
-        self.frame_count += 1
-
-        # Frame skipping
-        if self.frame_count % self.inference_interval != 0:
-            return
-
         frame = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+        frame = cv2.resize(frame, (320, 240))
 
-        # Reduce resolution for Raspberry Pi
-        frame = cv2.resize(frame, (224, 224))
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-        results = self.model(frame, verbose=False)[0]
+        # -------- White Cup HSV --------
+        lower = np.array([0, 0, 190])
+        upper = np.array([180, 50, 255])
+
+        mask = cv2.inRange(hsv, lower, upper)
+
+        kernel = np.ones((5, 5), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+        contours, _ = cv2.findContours(
+            mask,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE
+        )
 
         twist = Twist()
-        cup_found = False
 
-        for box in results.boxes:
-            cls_id = int(box.cls[0])
-            class_name = self.model.names[cls_id]
-            confidence = float(box.conf[0])
+        if contours:
+            largest = max(contours, key=cv2.contourArea)
+            area = cv2.contourArea(largest)
 
-            if class_name == "cup" and confidence > self.conf_threshold:
-                cup_found = True
+            # Ignore very small objects (noise)
+            if area < self.min_detect_area:
+                self.search(twist)
+                self.cmd_pub.publish(twist)
+                return
 
-                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                area = (x2 - x1) * (y2 - y1)
+            # Smooth area (avoid jitter)
+            area = self.smooth_factor * area + (1 - self.smooth_factor) * self.last_area
+            self.last_area = area
 
-                center_x = (x1 + x2) / 2
-                image_center = frame.shape[1] / 2
-                error_x = center_x - image_center
+            x, y, w, h = cv2.boundingRect(largest)
+            center_x = x + w // 2
+            image_center = frame.shape[1] // 2
+            error_x = center_x - image_center
 
-                if area < self.stop_area:
-                    twist.linear.x = self.linear_speed
+            # Apply dead zone (avoid shaking)
+            if abs(error_x) < self.dead_zone:
+                error_x = 0
 
-                    angular = -error_x * self.angular_gain
-                    angular = max(min(angular, self.max_angular),
-                                  -self.max_angular)
+            # Steering
+            angular = -error_x * self.angular_gain
+            angular = max(min(angular, self.max_angular), -self.max_angular)
 
-                    twist.angular.z = angular
-                else:
-                    twist.linear.x = 0.0
-                    twist.angular.z = 0.0
-                    rospy.loginfo("Cup reached. Stopping.")
+            # Forward control
+            if area < self.stop_area:
+                twist.linear.x = self.linear_speed
+                twist.angular.z = angular
+            else:
+                twist.linear.x = 0.0
+                twist.angular.z = 0.0
+                rospy.loginfo("Cup reached. Stopping.")
 
-                break
-
-        if not cup_found:
-            # Search behavior
-            twist.linear.x = 0.0
-            twist.angular.z = 0.3
+        else:
+            self.search(twist)
 
         self.cmd_pub.publish(twist)
+
+    def search(self, twist):
+        twist.linear.x = 0.0
+        twist.angular.z = 0.25
 
 
 if __name__ == '__main__':
